@@ -1,0 +1,9 @@
+/ipch/
+/Debug/
+/Release/
+*.sdf
+/.vs/
+/edit.VC.opendb
+/edit.aps
+/x64/
+/edit.opensdf

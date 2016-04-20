@@ -1,0 +1,260 @@
+// Copyright (C) 2016 Michael Trenholm-Boyle. See the LICENSE file for more.
+#include "stdafx.h"
+#include "unique_handle.h"
+#include "json/json.h"
+
+static bool find_atom_dir(std::wstring * atom_dir);
+static bool pipe_stdin_to_temp_file(std::wstring * temp_file);
+static bool delete_atom_application_initial_paths();
+static int launch_atom(const wchar_t * atom_dir, const wchar_t * arg);
+static int update_atom(const wchar_t * atom_dir);
+
+int WINAPI _tWinMain(HINSTANCE hInstance, HINSTANCE, LPTSTR lpszCmdLine, int nShowCmd) {
+    std::wstring atom_dir;
+    if(!find_atom_dir(&atom_dir)) {
+        MessageBox(NULL, L"Atom not installed", L"edit", MB_OK|MB_ICONSTOP);
+        return 1;
+    }
+    delete_atom_application_initial_paths();
+    int argc = 0;
+    int n = 0;
+    bool tried = false;
+    wchar_t ** argv = CommandLineToArgvW(GetCommandLineW(), &argc);
+    for (int i = 1; i < argc; ++i) {
+        tried = true;
+        n = std::max(n, launch_atom(atom_dir.c_str(), argv[i]));
+    }
+    LocalFree(argv);
+    std::wstring temp_file;
+    if (pipe_stdin_to_temp_file(&temp_file)) {
+        tried = true;
+        n = std::max(n, launch_atom(atom_dir.c_str(), temp_file.c_str()));
+    }
+    if(!tried) {
+        n = std::max(n, update_atom(atom_dir.c_str()));
+    }
+    return n;
+}
+
+#ifndef PATH_MAX
+#define PATH_MAX (32768-8)
+#endif
+
+template<typename T>
+struct free_delete {
+    inline void operator()(T * p) const {
+        if (p) {
+            free(p);
+        }
+    }
+};
+
+struct findclose_delete : public std::handle_delete<HANDLE> {
+public:
+	void operator()(HANDLE h) const {
+		FindClose(h);
+	}
+};
+
+static bool pipe_stdin_to_temp_file(std::wstring * temp_file) {
+    HANDLE h = GetStdHandle(STD_INPUT_HANDLE);
+    if (!h) {
+        return false;
+    }
+    const size_t BUFLEN = 4096;
+    std::unique_ptr<wchar_t, free_delete<wchar_t> > tmp(reinterpret_cast<wchar_t *>(calloc(PATH_MAX + 1, 2)));
+    if (!GetTempPath(PATH_MAX + 1, tmp.get())) {
+        return false;
+    }
+    std::unique_ptr<wchar_t, free_delete<wchar_t> > tmpfile(reinterpret_cast<wchar_t* >(calloc(PATH_MAX + 1, 2)));
+    if (!GetTempFileName(tmp.get(), L"TMP", 0, tmpfile.get())) {
+        return false;
+    }
+    size_t len = 0;
+    {
+        std::unique_handle<HANDLE> f(CreateFile(tmpfile.get(), GENERIC_READ | GENERIC_WRITE, 0, NULL, CREATE_ALWAYS, FILE_ATTRIBUTE_TEMPORARY, NULL));
+        if (!f) {
+            return false;
+        }
+        std::unique_ptr<char, free_delete<char> > cbuf(reinterpret_cast<char *>(calloc(BUFLEN, 1)));
+        while (true) {
+            DWORD r = 0;
+            BOOL b = ReadFile(h, cbuf.get(), static_cast<DWORD>(BUFLEN), &r, nullptr);
+            if (!b || !r) {
+                break;
+            }
+            DWORD w = 0;
+            b = WriteFile(f.get(), cbuf.get(), r, &w, nullptr);
+            if (!b || (r != w)) {
+                break;
+            }
+            len += w;
+        }
+    }
+    if (!len) {
+        DeleteFile(tmpfile.get());
+        return false;
+    }
+    *temp_file = std::wstring(tmpfile.get());
+    return true;
+}
+
+static bool find_atom_dir(std::wstring * atom_dir) {
+    std::unique_ptr<wchar_t, free_delete<wchar_t> > dir(reinterpret_cast<wchar_t *>(calloc(PATH_MAX + 1, 2)));
+    if (!GetEnvironmentVariable(L"LOCALAPPDATA", dir.get(), PATH_MAX - 80)) {
+        return false;
+    }
+    wcscat_s(dir.get(), PATH_MAX, L"\\atom");
+    WIN32_FIND_DATA fd = { 0 };
+    std::unique_handle<HANDLE, findclose_delete> hf;
+    {
+        std::unique_ptr<wchar_t, free_delete<wchar_t> > pat(reinterpret_cast<wchar_t *>(calloc(PATH_MAX + 1, 2)));
+        wcscpy_s(pat.get(), PATH_MAX, dir.get());
+        wcscat_s(pat.get(), PATH_MAX, L"\\app-*");
+        hf.reset(FindFirstFile(pat.get(), &fd));
+    }
+    if (!hf) {
+        return false;
+    }
+    int major = -1, minor = -1, build = -1, patch = -1;
+    while (true) {
+        if (FILE_ATTRIBUTE_DIRECTORY == (FILE_ATTRIBUTE_DIRECTORY & fd.dwFileAttributes)) {
+            int m = -1, n = -1, b = -1, p = -1;
+            if (4 != swscanf_s(fd.cFileName, L"app-%d.%d.%d.%d", &m, &n, &b, &p)) {
+                p = -1;
+                if (3 != swscanf_s(fd.cFileName, L"app-%d.%d.%d", &m, &n, &b)) {
+                    b = -1;
+                    if (2 != swscanf_s(fd.cFileName, L"app-%d.%d", &m, &n)) {
+                        n = -1;
+                        if (1 != swscanf_s(fd.cFileName, L"app-%d", &m)) {
+                            m = -1;
+                        }
+                    }
+                }
+            }
+            if (m >= 0) {
+                if (m > major) {
+                    major = m;
+                    minor = n;
+                    build = b;
+                    patch = p;
+                } else if (m == major) {
+                    if (n > minor) {
+                        minor = n;
+                        build = b;
+                        patch = p;
+                    } else if (n == minor) {
+                        if (b > build) {
+                            build = b;
+                            patch = p;
+                        } else if (b == build) {
+                            if (p > patch) {
+                                patch = p;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        if (!FindNextFile(hf.get(), &fd)) {
+            break;
+        }
+    }
+    if (major < 0) {
+        return false;
+    }
+    wchar_t buf[50] = { 0 };
+    const wchar_t * pat = L"\\app-%d";
+    if (minor >= 0) {
+        pat = L"\\app-%d.%d";
+        if (build >= 0) {
+            pat = L"\\app-%d.%d.%d";
+            if (patch >= 0) {
+                pat = L"\\app-%d.%d.%d.%d";
+            }
+        }
+    }
+    swprintf_s(buf, pat, major, minor, build, patch);
+    wcscat_s(dir.get(), PATH_MAX, buf);
+    *atom_dir = std::wstring(dir.get());
+    return true;
+}
+
+static bool delete_atom_application_initial_paths() {
+    std::unique_ptr<wchar_t, free_delete<wchar_t> > path;
+    path.reset(reinterpret_cast<wchar_t *>(calloc(PATH_MAX + 1, 2)));
+    if (!GetEnvironmentVariable(L"USERPROFILE", path.get(), PATH_MAX)) {
+        return false;
+    }
+    wcscat_s(path.get(), PATH_MAX, L"\\.atom\\storage\\application.json");
+    if(GetFileAttributes(path.get()) == INVALID_FILE_ATTRIBUTES) {
+        return false;
+    }
+    Json::Value application;
+    {
+        std::ifstream fin(path.get(), std::ios::binary);
+        if (!fin.is_open()) {
+            return false;
+        }
+        fin >> application;
+    }
+    if (application.type() != Json::arrayValue || application.size() < 1 || application[0].type() != Json::objectValue || !application[0].isMember("initialPaths") || application[0]["initialPaths"].type() != Json::arrayValue) {
+        return false;
+    }
+    application[0]["initialPaths"].clear();
+    {
+        std::ofstream fout(path.get(), std::ios::binary | std::ios::trunc);
+        if (!fout.is_open()) {
+            return false;
+        }
+        fout << application;
+    }
+    return true;
+}
+
+static int launch_atom(const wchar_t * atom_dir, const wchar_t * arg) {
+    std::unique_ptr<wchar_t, free_delete<wchar_t> > node_exe, atom_js, cli;
+    node_exe.reset(reinterpret_cast<wchar_t *>(calloc(PATH_MAX + 1, 2)));
+    wcscpy_s(node_exe.get(), PATH_MAX, atom_dir);
+    wcscat_s(node_exe.get(), PATH_MAX, L"\\resources\\app\\apm\\bin\\node.exe");
+    atom_js.reset(reinterpret_cast<wchar_t *>(calloc(PATH_MAX + 1, 2)));
+    wcscpy_s(atom_js.get(), PATH_MAX, atom_dir);
+    wcscat_s(atom_js.get(), PATH_MAX, L"\\resources\\cli\\atom.js");
+    size_t len = wcslen(node_exe.get()) + wcslen(atom_js.get()) + wcslen(arg) + 9;
+    cli.reset(reinterpret_cast<wchar_t *>(calloc(len + 1, 2)));
+    swprintf_s(cli.get(), len, *arg ? L"\"%s\" \"%s\" \"%s\"" : L"\"%s\" \"%s\"", node_exe.get(), atom_js.get(), arg);
+    STARTUPINFO si = { 0 };
+    si.cb = sizeof(si);
+    si.dwFlags = STARTF_FORCEONFEEDBACK;
+    PROCESS_INFORMATION pi = { 0 };
+    if(!CreateProcess(node_exe.get(), cli.get(), nullptr, nullptr, FALSE, DETACHED_PROCESS, nullptr, L".", &si, &pi)) {
+        return 2;
+    }
+    CloseHandle(pi.hThread);
+    WaitForInputIdle(pi.hProcess, 7000);
+    CloseHandle(pi.hProcess);
+    return 0;
+}
+
+static int update_atom(const wchar_t * atom_dir) {
+    std::unique_ptr<wchar_t, free_delete<wchar_t> > update_exe, cli;
+    update_exe.reset(reinterpret_cast<wchar_t *>(calloc(PATH_MAX + 1, 2)));
+    if(!GetEnvironmentVariable(L"LOCALAPPDATA", update_exe.get(), PATH_MAX - 16)) {
+        return 1;
+    }
+    wcscat_s(update_exe.get(), PATH_MAX, L"\\atom\\Update.exe");
+    size_t len = wcslen(update_exe.get()) + 27;
+    cli.reset(reinterpret_cast<wchar_t *>(calloc(len + 1, 2)));
+    swprintf_s(cli.get(), len, L"\"%s\" --processStart atom.exe", update_exe.get());
+    STARTUPINFO si = { 0 };
+    si.cb = sizeof(si);
+    si.dwFlags = STARTF_FORCEONFEEDBACK;
+    PROCESS_INFORMATION pi = { 0 };
+    if(!CreateProcess(update_exe.get(), cli.get(), nullptr, nullptr, FALSE, DETACHED_PROCESS, nullptr, atom_dir, &si, &pi)) {
+        return 2;
+    }
+    CloseHandle(pi.hThread);
+    WaitForInputIdle(pi.hProcess, 7000);
+    CloseHandle(pi.hProcess);
+    return 0;
+}

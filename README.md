@@ -38,6 +38,11 @@ The temporary file is _not_ automatically deleted.
 
 This will run the Atom auto-updater, which will then launch the application.
 
+`edit.exe --wait file1 ...`
+
+This will run the editor and wait for the Atom window to be closed. The wait-until-close behaviour can be made
+default by renaming the program executable file to `edit-wait.exe`.
+
 **N.B.**	The list of files to be opened upon startup contained in
 `~/.atom/storage/application.js` is cleared every time the program runs.
 

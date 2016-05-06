@@ -6,32 +6,39 @@
 static bool find_atom_dir(std::wstring * atom_dir);
 static bool pipe_stdin_to_temp_file(std::wstring * temp_file);
 static bool delete_atom_application_initial_paths();
-static int launch_atom(const wchar_t * atom_dir, const wchar_t * arg);
-static int update_atom(const wchar_t * atom_dir);
+static int launch_atom(const wchar_t * atom_dir, const wchar_t * arg, bool wait = false);
+static int update_atom(const wchar_t * atom_dir, bool wait = false);
+static bool program_name_implies_wait();
+static bool wcsiendswith(const wchar_t * str, const wchar_t * suffix);
 
-int WINAPI _tWinMain(HINSTANCE hInstance, HINSTANCE, LPTSTR lpszCmdLine, int nShowCmd) {
+int wmain(int argc, wchar_t ** argv) {
     std::wstring atom_dir;
     if(!find_atom_dir(&atom_dir)) {
         MessageBox(NULL, L"Atom not installed", L"edit", MB_OK|MB_ICONSTOP);
         return 1;
     }
     delete_atom_application_initial_paths();
-    int argc = 0;
     int n = 0;
     bool tried = false;
-    wchar_t ** argv = CommandLineToArgvW(GetCommandLineW(), &argc);
+	bool wait = program_name_implies_wait();
+	SetEnvironmentVariable(L"ELECTRON_NO_ATTACH_CONSOLE", L"YES");
     for (int i = 1; i < argc; ++i) {
         tried = true;
-        n = std::max(n, launch_atom(atom_dir.c_str(), argv[i]));
+		if (wcscmp(argv[i], L"--wait") == 0) {
+			wait = true;
+		} else {
+			n = std::max(n, launch_atom(atom_dir.c_str(), argv[i], wait));
+		}
     }
-    LocalFree(argv);
-    std::wstring temp_file;
-    if (pipe_stdin_to_temp_file(&temp_file)) {
-        tried = true;
-        n = std::max(n, launch_atom(atom_dir.c_str(), temp_file.c_str()));
-    }
+	if (!tried) {
+		std::wstring temp_file;
+		if (pipe_stdin_to_temp_file(&temp_file)) {
+			tried = true;
+			n = std::max(n, launch_atom(atom_dir.c_str(), temp_file.c_str(), wait));
+		}
+	}
     if(!tried) {
-        n = std::max(n, update_atom(atom_dir.c_str()));
+        n = std::max(n, update_atom(atom_dir.c_str(), wait));
     }
     return n;
 }
@@ -212,31 +219,32 @@ static bool delete_atom_application_initial_paths() {
     return true;
 }
 
-static int launch_atom(const wchar_t * atom_dir, const wchar_t * arg) {
-    std::unique_ptr<wchar_t, free_delete<wchar_t> > node_exe, atom_js, cli;
-    node_exe.reset(reinterpret_cast<wchar_t *>(calloc(PATH_MAX + 1, 2)));
-    wcscpy_s(node_exe.get(), PATH_MAX, atom_dir);
-    wcscat_s(node_exe.get(), PATH_MAX, L"\\resources\\app\\apm\\bin\\node.exe");
-    atom_js.reset(reinterpret_cast<wchar_t *>(calloc(PATH_MAX + 1, 2)));
-    wcscpy_s(atom_js.get(), PATH_MAX, atom_dir);
-    wcscat_s(atom_js.get(), PATH_MAX, L"\\resources\\cli\\atom.js");
-    size_t len = wcslen(node_exe.get()) + wcslen(atom_js.get()) + wcslen(arg) + 9;
+static int launch_atom(const wchar_t * atom_dir, const wchar_t * arg, bool wait) {
+	std::unique_ptr<wchar_t, free_delete<wchar_t> > atom_exe, cli;
+    atom_exe.reset(reinterpret_cast<wchar_t *>(calloc(PATH_MAX + 1, 2)));
+    wcscpy_s(atom_exe.get(), PATH_MAX, atom_dir);
+    wcscat_s(atom_exe.get(), PATH_MAX, L"\\atom.exe");
+    size_t len = wcslen(atom_exe.get()) + wcslen(arg) + 9;
     cli.reset(reinterpret_cast<wchar_t *>(calloc(len + 1, 2)));
-    swprintf_s(cli.get(), len, *arg ? L"\"%s\" \"%s\" \"%s\"" : L"\"%s\" \"%s\"", node_exe.get(), atom_js.get(), arg);
+    swprintf_s(cli.get(), len, *arg ? L"\"%s\" \"%s\"" : L"\"%s\"", atom_exe.get(), arg);
     STARTUPINFO si = { 0 };
     si.cb = sizeof(si);
-    si.dwFlags = STARTF_FORCEONFEEDBACK;
-    PROCESS_INFORMATION pi = { 0 };
-    if(!CreateProcess(node_exe.get(), cli.get(), nullptr, nullptr, FALSE, DETACHED_PROCESS, nullptr, L".", &si, &pi)) {
+	si.dwFlags = STARTF_FORCEONFEEDBACK;
+	PROCESS_INFORMATION pi = { 0 };
+    if(!CreateProcess(atom_exe.get(), cli.get(), nullptr, nullptr, FALSE, DETACHED_PROCESS, nullptr, L".", &si, &pi)) {
         return 2;
     }
+	if (wait) {
+		WaitForSingleObject(pi.hProcess, INFINITE);
+	} else {
+		WaitForInputIdle(pi.hProcess, 7000);
+	}
     CloseHandle(pi.hThread);
-    WaitForInputIdle(pi.hProcess, 7000);
     CloseHandle(pi.hProcess);
     return 0;
 }
 
-static int update_atom(const wchar_t * atom_dir) {
+static int update_atom(const wchar_t * atom_dir, bool wait) {
     std::unique_ptr<wchar_t, free_delete<wchar_t> > update_exe, cli;
     update_exe.reset(reinterpret_cast<wchar_t *>(calloc(PATH_MAX + 1, 2)));
     if(!GetEnvironmentVariable(L"LOCALAPPDATA", update_exe.get(), PATH_MAX - 16)) {
@@ -250,11 +258,28 @@ static int update_atom(const wchar_t * atom_dir) {
     si.cb = sizeof(si);
     si.dwFlags = STARTF_FORCEONFEEDBACK;
     PROCESS_INFORMATION pi = { 0 };
-    if(!CreateProcess(update_exe.get(), cli.get(), nullptr, nullptr, FALSE, DETACHED_PROCESS, nullptr, atom_dir, &si, &pi)) {
+    if(!CreateProcess(update_exe.get(), cli.get(), nullptr, nullptr, FALSE, wait ? CREATE_NO_WINDOW : DETACHED_PROCESS, nullptr, atom_dir, &si, &pi)) {
         return 2;
     }
     CloseHandle(pi.hThread);
-    WaitForInputIdle(pi.hProcess, 7000);
+	if (wait) {
+		WaitForSingleObject(pi.hProcess, INFINITE);
+	} else {
+		WaitForInputIdle(pi.hProcess, 7000);
+	}
     CloseHandle(pi.hProcess);
     return 0;
+}
+
+static bool program_name_implies_wait() {
+	wchar_t buf[MAX_PATH + 1] = { 0 };
+	GetModuleFileName(NULL, buf, sizeof(buf) / sizeof(buf[0]) - 1);
+	return wcsiendswith(buf, L"-wait.exe");
+}
+
+
+static bool wcsiendswith(const wchar_t * string, const wchar_t * suffix) {
+	size_t stringlen = wcslen(string);
+	size_t suffixlen = wcslen(suffix);
+	return stringlen >= suffixlen && _wcsicmp(string + stringlen - suffixlen, suffix) == 0;
 }

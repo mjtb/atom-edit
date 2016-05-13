@@ -283,7 +283,7 @@ static int update_atom(const wchar_t * atom_dir, bool wait) {
 static bool program_name_implies_wait() {
 	wchar_t buf[MAX_PATH + 1] = { 0 };
 	GetModuleFileName(NULL, buf, sizeof(buf) / sizeof(buf[0]) - 1);
-	return wcsiendswith(buf, L"-wait.exe");
+	return (_wcsicmp(buf, L"editor.exe") == 0) || wcsiendswith(buf, L"\\editor.exe");
 }
 
 

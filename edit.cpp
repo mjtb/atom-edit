@@ -23,10 +23,10 @@ int wmain(int argc, wchar_t ** argv) {
 	bool wait = program_name_implies_wait();
 	SetEnvironmentVariable(L"ELECTRON_NO_ATTACH_CONSOLE", L"YES");
     for (int i = 1; i < argc; ++i) {
-        tried = true;
 		if (wcscmp(argv[i], L"--wait") == 0) {
 			wait = true;
 		} else {
+	        tried = true;
 			n = std::max(n, launch_atom(atom_dir.c_str(), argv[i], wait));
 		}
     }
@@ -64,10 +64,10 @@ public:
 };
 
 static bool pipe_stdin_to_temp_file(std::wstring * temp_file) {
-    HANDLE h = GetStdHandle(STD_INPUT_HANDLE);
-    if (!h) {
-        return false;
-    }
+	HANDLE h = GetStdHandle(STD_INPUT_HANDLE);
+	if(!std::handle_traits<HANDLE>().is_valid_value(h)) {
+		return false;
+	}
     const size_t BUFLEN = 4096;
     std::unique_ptr<wchar_t, free_delete<wchar_t> > tmp(reinterpret_cast<wchar_t *>(calloc(PATH_MAX + 1, 2)));
     if (!GetTempPath(PATH_MAX + 1, tmp.get())) {
@@ -84,8 +84,16 @@ static bool pipe_stdin_to_temp_file(std::wstring * temp_file) {
             return false;
         }
         std::unique_ptr<char, free_delete<char> > cbuf(reinterpret_cast<char *>(calloc(BUFLEN, 1)));
+		bool first = true;
         while (true) {
             DWORD r = 0;
+			if (first) {
+				PeekNamedPipe(h, cbuf.get(), static_cast<DWORD>(BUFLEN), &r, nullptr, nullptr);
+				if (!r) {
+					break;
+				}
+				first = false;
+			}
             BOOL b = ReadFile(h, cbuf.get(), static_cast<DWORD>(BUFLEN), &r, nullptr);
             if (!b || !r) {
                 break;
@@ -224,9 +232,9 @@ static int launch_atom(const wchar_t * atom_dir, const wchar_t * arg, bool wait)
     atom_exe.reset(reinterpret_cast<wchar_t *>(calloc(PATH_MAX + 1, 2)));
     wcscpy_s(atom_exe.get(), PATH_MAX, atom_dir);
     wcscat_s(atom_exe.get(), PATH_MAX, L"\\atom.exe");
-    size_t len = wcslen(atom_exe.get()) + wcslen(arg) + 9;
+    size_t len = wcslen(atom_exe.get()) + wcslen(arg ? arg : L"") + 9;
     cli.reset(reinterpret_cast<wchar_t *>(calloc(len + 1, 2)));
-    swprintf_s(cli.get(), len, *arg ? L"\"%s\" \"%s\"" : L"\"%s\"", atom_exe.get(), arg);
+    swprintf_s(cli.get(), len, (arg && *arg) ? L"\"%s\" \"%s\"" : L"\"%s\"", atom_exe.get(), arg);
     STARTUPINFO si = { 0 };
     si.cb = sizeof(si);
 	si.dwFlags = STARTF_FORCEONFEEDBACK;
@@ -251,9 +259,10 @@ static int update_atom(const wchar_t * atom_dir, bool wait) {
         return 1;
     }
     wcscat_s(update_exe.get(), PATH_MAX, L"\\atom\\Update.exe");
-    size_t len = wcslen(update_exe.get()) + 27;
+	static const wchar_t * url = L"https://github.com/atom/atom/releases";
+    size_t len = wcslen(update_exe.get()) + 14 + wcslen(url);
     cli.reset(reinterpret_cast<wchar_t *>(calloc(len + 1, 2)));
-    swprintf_s(cli.get(), len, L"\"%s\" --processStart atom.exe", update_exe.get());
+    swprintf_s(cli.get(), len, L"\"%s\" --update=%s", update_exe.get(), url);
     STARTUPINFO si = { 0 };
     si.cb = sizeof(si);
     si.dwFlags = STARTF_FORCEONFEEDBACK;
@@ -268,7 +277,7 @@ static int update_atom(const wchar_t * atom_dir, bool wait) {
 		WaitForInputIdle(pi.hProcess, 7000);
 	}
     CloseHandle(pi.hProcess);
-    return 0;
+    return launch_atom(atom_dir, nullptr, wait);
 }
 
 static bool program_name_implies_wait() {
